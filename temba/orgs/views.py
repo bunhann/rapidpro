@@ -1,8 +1,10 @@
 from __future__ import absolute_import, unicode_literals
 
+import itertools
 import json
 import logging
 import plivo
+import nexmo
 import six
 
 from collections import OrderedDict
@@ -19,28 +21,33 @@ from django.core.validators import validate_email
 from django.db import IntegrityError
 from django.db.models import Sum, Q, F, ExpressionWrapper, IntegerField
 from django.forms import Form
-from django.http import HttpResponse, HttpResponseRedirect
+from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.utils import timezone
 from django.utils.http import urlquote
+from django.utils.safestring import mark_safe
 from django.utils.text import slugify
 from django.utils.translation import ugettext_lazy as _
+from django.views.decorators.csrf import csrf_exempt
 from django.views.generic import View
-from operator import attrgetter
+from email.utils import parseaddr
+from functools import cmp_to_key
 from smartmin.views import SmartCRUDL, SmartCreateView, SmartFormView, SmartReadView, SmartUpdateView, SmartListView, SmartTemplateView
+from smartmin.views import SmartModelFormView, SmartModelActionView
 from datetime import timedelta
 from temba.api.models import APIToken
-from temba.assets.models import AssetType
+from temba.campaigns.models import Campaign
 from temba.channels.models import Channel
+from temba.flows.models import Flow
 from temba.formax import FormaxMixin
-from temba.nexmo import NexmoClient, NexmoValidationError
-from temba.utils import analytics, build_json_response, languages
-from temba.utils.middleware import disable_middleware
+from temba.utils import analytics, languages
 from temba.utils.timezones import TimeZoneFormField
+from temba.utils.email import is_valid_address
 from twilio.rest import TwilioRestClient
 from .models import Org, OrgCache, OrgEvent, TopUp, Invitation, UserSettings, get_stripe_credentials
 from .models import MT_SMS_EVENTS, MO_SMS_EVENTS, MT_CALL_EVENTS, MO_CALL_EVENTS, ALARM_EVENTS
 from .models import SUSPENDED, WHITELISTED, RESTORED, NEXMO_UUID, NEXMO_SECRET, NEXMO_KEY
-from .models import TRANSFERTO_AIRTIME_API_TOKEN, TRANSFERTO_ACCOUNT_LOGIN
+from .models import TRANSFERTO_AIRTIME_API_TOKEN, TRANSFERTO_ACCOUNT_LOGIN, SMTP_FROM_EMAIL
+from .models import SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, SMTP_PORT, SMTP_ENCRYPTION
 
 
 def check_login(request):
@@ -112,6 +119,24 @@ class OrgPermsMixin(object):
         return self.has_org_perm(self.permission)
 
 
+class AnonMixin(OrgPermsMixin):
+    """
+    Mixin that makes sure that anonymous orgs cannot add channels (have no permission if anon)
+    """
+    def has_permission(self, request, *args, **kwargs):
+        org = self.derive_org()
+
+        # can this user break anonymity? then we are fine
+        if self.get_user().has_perm('contacts.contact_break_anon'):
+            return True
+
+        # otherwise if this org is anon, no go
+        if not org or org.is_anon:
+            return False
+        else:
+            return super(AnonMixin, self).has_permission(request, *args, **kwargs)
+
+
 class OrgObjPermsMixin(OrgPermsMixin):
 
     def get_object_org(self):
@@ -157,13 +182,17 @@ class ModalMixin(SmartFormView):
         return context
 
     def form_valid(self, form):
-
-        self.object = form.save(commit=False)
+        if isinstance(form, forms.ModelForm):
+            self.object = form.save(commit=False)
 
         try:
-            self.object = self.pre_save(self.object)
-            self.save(self.object)
-            self.object = self.post_save(self.object)
+            if isinstance(self, SmartModelFormView):
+                self.object = self.pre_save(self.object)
+                self.save(self.object)
+                self.object = self.post_save(self.object)
+
+            elif isinstance(self, SmartModelActionView):
+                self.execute_action()
 
             messages.success(self.request, self.derive_success_message())
 
@@ -176,10 +205,9 @@ class ModalMixin(SmartFormView):
                 response['Temba-Success'] = self.get_success_url()
                 return response
 
-        except (IntegrityError, ValueError) as e:
-            message = str(e).capitalize()
-            errors = self.form._errors.setdefault(forms.forms.NON_FIELD_ERRORS, forms.utils.ErrorList())
-            errors.append(message)
+        except (IntegrityError, ValueError, ValidationError) as e:
+            message = getattr(e, 'message', str(e).capitalize())
+            self.form.add_error(None, message)
             return self.render_to_response(self.get_context_data(form=form))
 
 
@@ -421,10 +449,10 @@ class UserSettingsCRUDL(SmartCRUDL):
 
 class OrgCRUDL(SmartCRUDL):
     actions = ('signup', 'home', 'webhook', 'edit', 'edit_sub_org', 'join', 'grant', 'accounts', 'create_login', 'choose',
-               'manage_accounts', 'manage_accounts_sub_org', 'manage', 'update', 'country', 'languages', 'clear_cache', 'download',
+               'manage_accounts', 'manage_accounts_sub_org', 'manage', 'update', 'country', 'languages', 'clear_cache',
                'twilio_connect', 'twilio_account', 'nexmo_configuration', 'nexmo_account', 'nexmo_connect',
                'sub_orgs', 'create_sub_org', 'export', 'import', 'plivo_connect', 'resthooks', 'service', 'surveyor',
-               'transfer_credits', 'transfer_to_account')
+               'transfer_credits', 'transfer_to_account', 'smtp_server')
 
     model = Org
 
@@ -473,7 +501,7 @@ class OrgCRUDL(SmartCRUDL):
             except Exception as e:
                 # this is an unexpected error, report it to sentry
                 logger = logging.getLogger(__name__)
-                logger.error('Exception on app import: %s' % unicode(e), exc_info=True)
+                logger.error('Exception on app import: %s' % six.text_type(e), exc_info=True)
                 form._errors['import_file'] = form.error_class([_("Sorry, your import file is invalid.")])
                 return self.form_invalid(form)
 
@@ -482,93 +510,88 @@ class OrgCRUDL(SmartCRUDL):
     class Export(InferOrgMixin, OrgPermsMixin, SmartTemplateView):
 
         def post(self, request, *args, **kwargs):
+            org = self.get_object()
 
-            # get all of the selected flows and campaigns
-            from temba.flows.models import Flow
-            from temba.campaigns.models import Campaign
+            # fetch the selected flows and campaigns
+            flows = Flow.objects.filter(id__in=self.request.POST.getlist('flows'), org=org, is_active=True)
+            campaigns = Campaign.objects.filter(id__in=self.request.POST.getlist('campaigns'), org=org, is_active=True)
 
-            flows = set(Flow.objects.filter(id__in=self.request.POST.getlist('flows'), org=self.get_object(), is_active=True))
-            campaigns = Campaign.objects.filter(id__in=self.request.POST.getlist('campaigns'), org=self.get_object())
+            components = set(itertools.chain(flows, campaigns))
 
-            # by default we include the triggers for the requested flows
-            dependencies = dict(flows=set(), campaigns=set(), groups=set(), triggers=set())
+            # add triggers for the selected flows
             for flow in flows:
-                dependencies = flow.get_dependencies(dependencies)
+                components.update(flow.triggers.filter(is_active=True, is_archived=False))
 
-            triggers = dependencies['triggers']
-
-            export = self.get_object().export_definitions(request.branding['link'], flows, campaigns, triggers)
-            response = HttpResponse(json.dumps(export, indent=2), content_type='application/javascript')
-            response['Content-Disposition'] = 'attachment; filename=%s.json' % slugify(self.get_object().name)
+            export = org.export_definitions(request.branding['link'], components)
+            response = JsonResponse(export, json_dumps_params=dict(indent=2))
+            response['Content-Disposition'] = 'attachment; filename=%s.json' % slugify(org.name)
             return response
 
         def get_context_data(self, **kwargs):
-            from collections import defaultdict
-
-            def connected_components(lists):
-                neighbors = defaultdict(set)
-                seen = set()
-                for each in lists:
-                    for item in each:
-                        neighbors[item].update(each)
-
-                def component(node, neighbors=neighbors, seen=seen, see=seen.add):
-                    nodes = {node}
-                    next_node = nodes.pop
-                    while nodes:
-                        node = next_node()
-                        see(node)
-                        nodes |= neighbors[node] - seen
-                        yield node
-                for node in neighbors:
-                    if node not in seen:
-                        yield sorted(component(node))
-
             context = super(OrgCRUDL.Export, self).get_context_data(**kwargs)
 
-            include_archived = self.request.GET.get('archived', 0)
+            org = self.get_object()
+            include_archived = bool(int(self.request.GET.get('archived', 0)))
 
-            # all of our user facing flows
-            flows = self.get_object().get_export_flows(include_archived=include_archived)
-
-            # now add lists of flows with their dependencies
-            all_depends = []
-            for flow in flows:
-                depends = flow.get_dependencies()
-                all_depends.append([flow] + list(depends['flows']) + list(depends['campaigns']))
-
-            # add all campaigns
-            from temba.campaigns.models import Campaign
-            campaigns = Campaign.objects.filter(org=self.get_object())
-
-            if not include_archived:
-                campaigns = campaigns.filter(is_archived=False)
-
-            for campaign in campaigns:
-                all_depends.append((campaign,))
-
-            buckets = connected_components(all_depends)
-
-            # sort our buckets, campaigns, flows, triggers
-            bucket_list = []
-            singles = []
-            for bucket in buckets:
-                if len(bucket) > 1:
-                    bucket_list.append(sorted(list(bucket), key=attrgetter('__class__', 'name')))
-                else:
-                    singles.append(bucket[0])
-
-            # put the buckets with the most items first
-            bucket_list = sorted(bucket_list, key=lambda s: len(s), reverse=True)
-
-            # sort our singles by type
-            singles = sorted(singles, key=attrgetter('__class__', 'name'))
+            buckets, singles = self.generate_export_buckets(org, include_archived)
 
             context['archived'] = include_archived
-            context['buckets'] = bucket_list
+            context['buckets'] = buckets
             context['singles'] = singles
-
             return context
+
+        def generate_export_buckets(self, org, include_archived):
+            """
+            Generates a set of buckets of related exportable flows and campaigns
+            """
+            dependencies = org.generate_dependency_graph(include_archived=include_archived)
+
+            unbucketed = set(dependencies.keys())
+            buckets = []
+
+            # helper method to add a component and its dependencies to a bucket
+            def collect_component(c, bucket):
+                if c in bucket:  # pragma: no cover
+                    return
+
+                unbucketed.remove(c)
+                bucket.add(c)
+
+                for d in dependencies[c]:
+                    if d in unbucketed:
+                        collect_component(d, bucket)
+
+            while unbucketed:
+                component = next(iter(unbucketed))
+
+                bucket = set()
+                buckets.append(bucket)
+
+                collect_component(component, bucket)
+
+            # collections with only one non-group component should be merged into a single "everything else" collection
+            non_single_buckets = []
+            singles = set()
+
+            # items within buckets are sorted by type and name
+            def sort_key(c):
+                return c.__class__, c.name.lower()
+
+            # buckets with a single item are merged into a special singles bucket
+            for b in buckets:
+                if len(b) > 1:
+                    sorted_bucket = sorted(list(b), key=sort_key)
+                    non_single_buckets.append(sorted_bucket)
+                else:
+                    singles.update(b)
+
+            # put the buckets with the most items first
+            non_single_buckets = sorted(non_single_buckets, key=lambda b: len(b), reverse=True)
+
+            # sort singles
+            singles = sorted(list(singles), key=sort_key)
+
+            return non_single_buckets, singles
 
     class TwilioConnect(ModalMixin, InferOrgMixin, OrgPermsMixin, SmartFormView):
 
@@ -638,7 +661,7 @@ class OrgCRUDL(SmartCRUDL):
 
                 return HttpResponseRedirect(reverse("channels.channel_claim_nexmo"))
 
-            except NexmoValidationError:
+            except nexmo.Error:
                 return super(OrgCRUDL.NexmoConfiguration, self).get(request, *args, **kwargs)
 
         def get_context_data(self, **kwargs):
@@ -679,8 +702,9 @@ class OrgCRUDL(SmartCRUDL):
                         raise ValidationError(_("You must enter your Nexmo Account API Secret"))
 
                     try:
-                        client = NexmoClient(api_key, api_secret)
-                        client.get_numbers()
+                        from nexmo import Client as NexmoClient
+                        client = NexmoClient(key=api_key, secret=api_secret)
+                        client.get_balance()
                     except Exception:  # pragma: needs cover
                         raise ValidationError(_("Your Nexmo API key and secret seem invalid. Please check them again and retry."))
 
@@ -695,7 +719,7 @@ class OrgCRUDL(SmartCRUDL):
         def derive_initial(self):
             initial = super(OrgCRUDL.NexmoAccount, self).derive_initial()
             org = self.get_object()
-            config = json.loads(org.config)
+            config = org.config_json()
             initial['api_key'] = config.get(NEXMO_KEY, '')
             initial['api_secret'] = config.get(NEXMO_SECRET, '')
             initial['disconnect'] = 'false'
@@ -740,8 +764,10 @@ class OrgCRUDL(SmartCRUDL):
                 api_secret = self.cleaned_data.get('api_secret', None)
 
                 try:
-                    client = NexmoClient(api_key, api_secret)
-                    client.get_numbers()
+                    from nexmo import Client as NexmoClient
+
+                    client = NexmoClient(key=api_key, secret=api_secret)
+                    client.get_balance()
                 except Exception:
                     raise ValidationError(_("Your Nexmo API key and secret seem invalid. Please check them again and retry."))
 
@@ -815,8 +841,109 @@ class OrgCRUDL(SmartCRUDL):
             response['Temba-Success'] = self.get_success_url()
             return response
 
+    class SmtpServer(InferOrgMixin, OrgPermsMixin, SmartUpdateView):
+        success_message = ""
+
+        class SmtpConfig(forms.ModelForm):
+            smtp_from_email = forms.CharField(max_length=128, label=_("Email Address"), required=False,
+                                              help_text=_("The from email address, can contain a name: ex: Jane Doe <jane@example.org>"))
+            smtp_host = forms.CharField(max_length=128, label=_("SMTP Host"), required=False)
+            smtp_username = forms.CharField(max_length=128, label=_("Username"), required=False)
+            smtp_password = forms.CharField(max_length=128, label=_("Password"), required=False)
+            smtp_port = forms.CharField(max_length=128, label=_("Port"), required=False)
+            smtp_encryption = forms.ChoiceField(choices=(('', _("No encryption")),
+                                                         ('T', _("Use TLS"))),
+                                                required=False, label=_("Encryption"))
+            disconnect = forms.CharField(widget=forms.HiddenInput, max_length=6, required=True)
+
+            def clean(self):
+                super(OrgCRUDL.SmtpServer.SmtpConfig, self).clean()
+                if self.cleaned_data.get('disconnect', 'false') == 'false':
+                    smtp_from_email = self.cleaned_data.get('smtp_from_email', None)
+                    smtp_host = self.cleaned_data.get('smtp_host', None)
+                    smtp_username = self.cleaned_data.get('smtp_username', None)
+                    smtp_password = self.cleaned_data.get('smtp_password', None)
+                    smtp_port = self.cleaned_data.get('smtp_port', None)
+
+                    if not smtp_from_email:
+                        raise ValidationError(_("You must enter a from email"))
+
+                    parsed = parseaddr(smtp_from_email)
+                    if not is_valid_address(parsed[1]):
+                        raise ValidationError(_("Please enter a valid email address"))
+
+                    if not smtp_host:
+                        raise ValidationError(_("You must enter the SMTP host"))
+
+                    if not smtp_username:
+                        raise ValidationError(_("You must enter the SMTP username"))
+
+                    if not smtp_password:
+                        raise ValidationError(_("You must enter the SMTP password"))
+
+                    if not smtp_port:
+                        raise ValidationError(_("You must enter the SMTP port"))
+
+                return self.cleaned_data
+
+            class Meta:
+                model = Org
+                fields = ('smtp_from_email', 'smtp_host', 'smtp_username', 'smtp_password', 'smtp_port', 'smtp_encryption', 'disconnect')
+
+        form_class = SmtpConfig
+
+        def derive_initial(self):
+            initial = super(OrgCRUDL.SmtpServer, self).derive_initial()
+            org = self.get_object()
+            config = org.config_json()
+            initial['smtp_from_email'] = config.get(SMTP_FROM_EMAIL, '')
+            initial['smtp_host'] = config.get(SMTP_HOST, '')
+            initial['smtp_username'] = config.get(SMTP_USERNAME, '')
+            initial['smtp_password'] = config.get(SMTP_PASSWORD, '')
+            initial['smtp_port'] = config.get(SMTP_PORT, '')
+            initial['smtp_encryption'] = config.get(SMTP_ENCRYPTION, '')
+
+            initial['disconnect'] = 'false'
+            return initial
+
+        def form_valid(self, form):
+            disconnect = form.cleaned_data.get('disconnect', 'false') == 'true'
+            user = self.request.user
+            org = user.get_org()
+
+            if disconnect:
+                org.remove_smtp_config(user)
+                return HttpResponseRedirect(reverse('orgs.org_home'))
+            else:
+                smtp_from_email = form.cleaned_data['smtp_from_email']
+                smtp_host = form.cleaned_data['smtp_host']
+                smtp_username = form.cleaned_data['smtp_username']
+                smtp_password = form.cleaned_data['smtp_password']
+                smtp_port = form.cleaned_data['smtp_port']
+                smtp_encryption = form.cleaned_data['smtp_encryption']
+
+                org.add_smtp_config(smtp_from_email, smtp_host, smtp_username, smtp_password, smtp_port, smtp_encryption, user)
+
+            return super(OrgCRUDL.SmtpServer, self).form_valid(form)
+
+        def get_context_data(self, **kwargs):
+            context = super(OrgCRUDL.SmtpServer, self).get_context_data(**kwargs)
+
+            org = self.get_object()
+            if org.has_smtp_config():
+                config = org.config_json()
+                from_email = config.get(SMTP_FROM_EMAIL)
+            else:
+                from_email = settings.FLOW_FROM_EMAIL
+
+            # populate our context with the from email (just the address)
+            context['flow_from_email'] = parseaddr(from_email)[1]
+
+            return context
+
     class Manage(SmartListView):
-        fields = ('credits', 'used', 'name', 'owner', 'created_on')
+        fields = ('credits', 'used', 'name', 'owner', 'service', 'created_on')
+        field_config = {'service': {'label': ''}}
         default_order = ('-credits', '-created_on',)
         search_fields = ('name__icontains', 'created_by__email__iexact', 'config__icontains')
         link_fields = ('name', 'owner')
@@ -833,37 +960,46 @@ class OrgCRUDL(SmartCRUDL):
                 used_class = 'used-warning'
             if used_pct >= 90:  # pragma: needs cover
                 used_class = 'used-alert'
-            return "<div class='used-pct %s'>%d%%</div>" % (used_class, used_pct)
+            return mark_safe("<div class='used-pct %s'>%d%%</div>" % (used_class, used_pct))
 
         def get_credits(self, obj):
             if not obj.credits:  # pragma: needs cover
                 obj.credits = 0
-            return "<div class='num-credits'><a href='%s'>%s</a></div>" % (reverse('orgs.topup_manage') + "?org=%d" % obj.id,
-                                                                           format(obj.credits, ",d"))
+            return mark_safe("<div class='num-credits'><a href='%s'>%s</a></div>"
+                             % (reverse('orgs.topup_manage') + "?org=%d" % obj.id, format(obj.credits, ",d")))
 
         def get_owner(self, obj):
-            owner = obj.latest_admin()
-
             # default to the created by if there are no admins
-            if not owner:  # pragma: needs cover
-                owner = obj.created_by
+            owner = obj.latest_admin() or obj.created_by
 
+            return mark_safe("<div class='owner-name'>%s %s</div><div class='owner-email'>%s</div>"
+                             % (owner.first_name, owner.last_name, owner))
+
+        def get_service(self, obj):
             url = reverse('orgs.org_service')
-            return "<a href='%s?organization=%d' class='service posterize btn btn-tiny'>Service</a><div class='owner-name'>%s %s</div>" \
-                   "<div class='owner-email'>%s</div>" % (url, obj.id, owner.first_name, owner.last_name, owner)
+
+            return mark_safe("<a href='%s?organization=%d' class='service posterize btn btn-tiny'>Service</a>"
+                             % (url, obj.id))
 
         def get_name(self, obj):
             suspended = ''
             if obj.is_suspended():
                 suspended = '<span class="suspended">(Suspended)</span>'
 
-            return "<div class='org-name'>%s %s</div><div class='org-timezone'>%s</div>" % (suspended, obj.name, obj.timezone)
+            return mark_safe("<div class='org-name'>%s %s</div><div class='org-timezone'>%s</div>"
+                             % (suspended, obj.name, obj.timezone))
 
         def derive_queryset(self, **kwargs):
             queryset = super(OrgCRUDL.Manage, self).derive_queryset(**kwargs)
-            queryset = queryset.filter(is_active=True, brand=self.request.branding['host'])
+            queryset = queryset.filter(is_active=True)
+
+            brand = self.request.branding.get('brand')
+            if brand:
+                queryset = queryset.filter(brand=brand)
+
             queryset = queryset.annotate(credits=Sum('topups__credits'))
             queryset = queryset.annotate(paid=Sum('topups__price'))
+
             return queryset
 
         def get_context_data(self, **kwargs):
@@ -1024,8 +1160,8 @@ class OrgCRUDL(SmartCRUDL):
 
             return initial
 
-        def get_form(self, form_class):
-            form = super(OrgCRUDL.ManageAccounts, self).get_form(form_class)
+        def get_form(self):
+            form = super(OrgCRUDL.ManageAccounts, self).get_form()
 
             self.org_users = self.get_object().get_org_users()
             self.fields_by_users = form.add_user_group_fields(self.ORG_GROUPS, self.org_users)
@@ -1174,19 +1310,22 @@ class OrgCRUDL(SmartCRUDL):
 
         def get_manage(self, obj):
             if obj.parent:  # pragma: needs cover
-                return '<a href="%s?org=%s"><div class="btn btn-tiny">Manage Accounts</div></a>' % (reverse('orgs.org_manage_accounts_sub_org'), obj.id)
+                return mark_safe('<a href="%s?org=%s"><div class="btn btn-tiny">Manage Accounts</div></a>'
+                                 % (reverse('orgs.org_manage_accounts_sub_org'), obj.id))
             return ''
 
         def get_credits(self, obj):
             credits = obj.get_credits_remaining()
-            return '<div class="edit-org" data-url="%s?org=%d"><div class="num-credits">%s</div></div>' % (reverse('orgs.org_edit_sub_org'), obj.id, format(credits, ",d"))
+            return mark_safe('<div class="edit-org" data-url="%s?org=%d"><div class="num-credits">%s</div></div>'
+                             % (reverse('orgs.org_edit_sub_org'), obj.id, format(credits, ",d")))
 
         def get_name(self, obj):
             org_type = 'child'
             if not obj.parent:
                 org_type = 'parent'
 
-            return "<div class='%s-org-name'>%s</div><div class='org-timezone'>%s</div>" % (org_type, obj.name, obj.timezone)
+            return mark_safe("<div class='%s-org-name'>%s</div><div class='org-timezone'>%s</div>"
+                             % (org_type, obj.name, obj.timezone))
 
         def derive_queryset(self, **kwargs):
             queryset = super(OrgCRUDL.SubOrgs, self).derive_queryset(**kwargs)
@@ -1257,7 +1396,7 @@ class OrgCRUDL(SmartCRUDL):
         title = _("Select your Organization")
 
         def get_user_orgs(self):
-            host = self.request.branding.get('host', settings.DEFAULT_BRAND)
+            host = self.request.branding.get('brand')
             return self.request.user.get_user_orgs(host)
 
         def pre_process(self, request, *args, **kwargs):
@@ -1524,10 +1663,7 @@ class OrgCRUDL(SmartCRUDL):
             context['form'] = self.form
             context['step'] = self.get_step()
 
-            if hasattr(self.form, 'cleaned_data'):
-                context['org'] = self.form.cleaned_data.get('org', None)
-
-            for key, field in self.form.fields.iteritems():
+            for key, field in six.iteritems(self.form.fields):
                 context[key] = field
 
             return context
@@ -1549,10 +1685,12 @@ class OrgCRUDL(SmartCRUDL):
 
                 org = self.form.cleaned_data.get('org', None)
 
-                self.form = OrgCRUDL.Surveyor.RegisterForm(initial=self.derive_initial())
                 context = self.get_context_data()
                 context['step'] = 2
                 context['org'] = org
+
+                self.form = OrgCRUDL.Surveyor.RegisterForm(initial=self.derive_initial())
+                context['form'] = self.form
 
                 return self.render_to_response(context)
             else:
@@ -1723,8 +1861,8 @@ class OrgCRUDL(SmartCRUDL):
         form_class = ResthookForm
         success_message = ''
 
-        def get_form(self, form_class):
-            form = super(OrgCRUDL.Resthooks, self).get_form(form_class)
+        def get_form(self):
+            form = super(OrgCRUDL.Resthooks, self).get_form()
             self.current_resthooks = form.add_resthook_fields()
             return form
 
@@ -1815,6 +1953,13 @@ class OrgCRUDL(SmartCRUDL):
 
             return obj
 
+        def get_context_data(self, **kwargs):
+            from temba.api.models import WebHookEvent
+
+            context = super(OrgCRUDL.Webhook, self).get_context_data(**kwargs)
+            context['failed_webhooks'] = WebHookEvent.get_recent_errored(self.request.user.get_org()).exists()
+            return context
+
     class Home(FormaxMixin, InferOrgMixin, OrgPermsMixin, SmartReadView):
         title = _("Your Account")
 
@@ -1877,6 +2022,9 @@ class OrgCRUDL(SmartCRUDL):
 
             if self.has_org_perm('orgs.org_country'):
                 formax.add_section('country', reverse('orgs.org_country'), icon='icon-location2')
+
+            if self.has_org_perm("orgs.org_smtp_server"):
+                formax.add_section('email', reverse('orgs.org_smtp_server'), icon='icon-envelop')
 
             if self.has_org_perm('orgs.org_transfer_to_account'):
                 if not self.object.is_connected_to_transferto():
@@ -1967,6 +2115,7 @@ class OrgCRUDL(SmartCRUDL):
                 airtime_api_token = form.cleaned_data['airtime_api_token']
 
                 org.connect_transferto(account_login, airtime_api_token, user)
+                org.refresh_transferto_account_currency()
                 return super(OrgCRUDL.TransferToAccount, self).form_valid(form)
 
     class TwilioAccount(InferOrgMixin, OrgPermsMixin, SmartUpdateView):
@@ -2224,7 +2373,7 @@ class OrgCRUDL(SmartCRUDL):
                 if len(matches) == 0:
                     search = self.request.GET.get('search', '').strip().lower()
                     matches += languages.search_language_names(search)
-                return build_json_response(dict(results=matches))
+                return JsonResponse(dict(results=matches))
 
             return super(OrgCRUDL.Languages, self).get(request, *args, **kwargs)
 
@@ -2255,28 +2404,6 @@ class OrgCRUDL(SmartCRUDL):
             cache = OrgCache(int(request.POST['cache']))
             num_deleted = self.get_object().clear_caches([cache])
             self.success_message = _("Cleared %s cache for this organization (%d keys)") % (cache.name, num_deleted)
-
-    class Download(SmartTemplateView):
-        """
-        For backwards compatibility, redirect old org/download style requests to the assets app
-        """
-        @classmethod
-        def derive_url_pattern(cls, path, action):
-            return r'%s/%s/(?P<task_type>\w+)/(?P<pk>\d+)/$' % (path, action)
-
-        def has_permission(self, request, *args, **kwargs):
-            return self.request.user.is_authenticated()
-
-        def get(self, request, *args, **kwargs):
-            types_to_assets = {'contacts': AssetType.contact_export,
-                               'flows': AssetType.results_export,
-                               'messages': AssetType.message_export}
-
-            task_type = self.kwargs.get('task_type')
-            asset_type = types_to_assets[task_type]
-            identifier = self.kwargs.get('pk')
-            return HttpResponseRedirect(reverse('assets.download',
-                                                kwargs=dict(type=asset_type.name, pk=identifier)))
 
 
 class TopUpCRUDL(SmartCRUDL):
@@ -2333,7 +2460,7 @@ class TopUpCRUDL(SmartCRUDL):
                 # if we end up with the same expiration, show the oldest first
                 return topup2.id - topup1.id
 
-            topups.sort(cmp=compare)
+            topups.sort(key=cmp_to_key(compare))
             context['topups'] = topups
             return context
 
@@ -2408,7 +2535,7 @@ class StripeHandler(View):  # pragma: no cover
     Handles WebHook events from Stripe.  We are interested as to when invoices are
     charged by Stripe so we can send the user an invoice email.
     """
-    @disable_middleware
+    @csrf_exempt
     def dispatch(self, *args, **kwargs):
         return super(StripeHandler, self).dispatch(*args, **kwargs)
 
@@ -2464,10 +2591,16 @@ class StripeHandler(View):  # pragma: no cover
                                invoice_id=charge.id,
                                invoice_date=charge_date.strftime("%b %e, %Y"),
                                amount=amount,
-                               org=org.name,
-                               cc_last4=charge.card.last4,
-                               cc_type=charge.card.type,
-                               cc_name=charge.card.name)
+                               org=org.name)
+
+                if getattr(charge, 'card', None):
+                    context['cc_last4'] = charge.card.last4
+                    context['cc_type'] = charge.card.type
+                    context['cc_name'] = charge.card.name
+
+                else:
+                    context['cc_type'] = 'bitcoin'
+                    context['cc_name'] = charge.source.bitcoin.address
 
                 admin_email = org.administrators.all().first().email
 
